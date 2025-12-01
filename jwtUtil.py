@@ -325,7 +325,11 @@ class TokenManager:
         """
         # 1. Prepare Header
         header = headers.copy() if headers else {}
-        # header["typ"] = "JWT" # Removed to avoid forcing it if not present
+        
+        # If typ is None, remove it to prevent "typ": null in JSON
+        if header.get("typ") is None:
+            header.pop("typ", None)
+
         header["alg"] = alg
         
         json_header = json.dumps(header, separators=(',', ':')).encode('utf-8')
@@ -444,9 +448,12 @@ def main():
                 # Prepare headers - Start with original headers to preserve 'kid' etc.
                 headers = original_headers.copy()
                 
-                # Remove 'alg' and 'typ' from original to let resign_token/manual_sign handle them or overwrite them
+                # Remove 'alg' from original to let resign_token/manual_sign handle them or overwrite them
                 headers.pop("alg", None)
-                headers.pop("typ", None)
+                
+                # Ensure 'typ' is not added if it wasn't present originally
+                if "typ" not in headers:
+                    headers["typ"] = None
                 
                 if args.set_header:
                     for h in args.set_header:
